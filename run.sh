@@ -14,8 +14,15 @@ fi
 
 cd "$(dirname "$0")/build"
 
+EXTRA_ARGS=()
+for arg in "$@"; do
+  if [[ "$arg" != "--show" ]]; then
+    EXTRA_ARGS+=("$arg")
+  fi
+done
+
 if [[ $SHOW -eq 1 ]]; then
-  ./avdet "$PIPE"
+  ./avdet "$PIPE" "${EXTRA_ARGS[@]}"
 else
-  ./avdet "$PIPE" --no-display
+  ./avdet "$PIPE" --no-display "${EXTRA_ARGS[@]}"
 fi

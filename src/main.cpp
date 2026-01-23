@@ -23,7 +23,7 @@ extern "C" void trtInit(const std::string& plan);
 // distance_m now added to be filled after the rest from lidar data 
 struct Det { Rect box; int cls; float score; float distance_m = -1.0f; };
 
-
+bool use_lidar = true;
 
 // Convert bbox centre x-coordinate into a horizontal angle in radians,
 // uses the camera horizontal FOV in degrees.
@@ -127,8 +127,10 @@ std::cout << "[DEBUG] main() start" << std::endl;
 
 // --no display flag , dont open view on screen , increases fps slightly 
 	bool show = true;
+	bool lidar_debug = false;
         for (int i = 1; i < argc; ++i) {
         if (string(argv[i]) == "--no-display") show = false;
+	if (string(argv[i]) == "--lidar-debug") lidar_debug = true;
     }
 
 
@@ -143,7 +145,9 @@ std::cout << "[DEBUG] main() start" << std::endl;
     nms_th=0.5f;
 // load trt engine , done once and reused all frames
   std::cout << "[DEBUG] before trtInit" << std::endl;
-    trtInit("/home/sean/models/yolov8n/yolov8n_fp16.plan"); // init using the .plan file path 
+    trtInit("/home/sean/models/yolov8n/yolov8n_fp16.plan"); // init using the .plan file path
+
+	 
     LidarC1 lidar("/dev/ttyUSB0", 460800);     // start the lidar 
     std::cout << "[DEBUG] after trtInit" << std::endl;
 
@@ -220,34 +224,54 @@ std::cout << "[DEBUG] main() start" << std::endl;
 	        if (iou > nms_th) rem[j] = 1; // then suppress if the overlap is too high
 	    }
 	}
-
-	// grab a lidar scan for this frame 
-	auto scan = lidar.getScan();
-
-    // now assign a lidar distance to each kept detection
+	
 	const float cam_fov_deg = 62.0f; // cam angle from rpi docs 
-	const float angle_window_deg = 3.0f; // this is the window around the centre of bbox we can search for points in 
-	
-	const float lidar_sign = +1.0f;         
-	const float lidar_yaw_offset_deg = 0.0f; // this can be tuned once i have a stable rig, not temp one we have right now 
+        const float angle_window_deg = 3.0f; // this is the window around the centre of bbox we can search for points in 
 
-	for (int id : keep) { // loop over indices that survived nms 
-	    Det& d = dets[id]; //get a refernece to that detection
-	    if (d.cls != 0) continue; // only fuse for PERSON class 0, for now anyway Can be adjusted later on 
-
-	    float cam_angle = bbox_center_angle(d.box, frame.cols, cam_fov_deg); // convert bbox centre into camera angle in rads 
+        const float lidar_sign = +1.0f;         
+        const float lidar_yaw_offset_deg = 0.0f; // this can be tuned once i have a stable rig, not temp one we have right now 
 	
-        // convert cam angle into lidar angle 
-        // lidar sign handle left and right mismatch between camera and lidar coords 
-        // yaw offset hasnt been dealt with as of yet 
-	    float lidar_angle = wrap_rad_pm_pi(lidar_sign * cam_angle + deg2radf(lidar_yaw_offset_deg));
-        // look into lidar scan for points near lidar angle within spec window
-        //retruns one closest 
-	    d.distance_m = distance_from_scan_for_angle(scan, lidar_angle, angle_window_deg, 10.0f);
+	static std::vector<LidarPoint> scan_cache;
+	static int64 last_scan_tick = 0;                 // tick count of last scan update
+	double scan_period_s = 0.10;               
+
+	// grab a lidar scan for this frame
+	if(use_lidar){	
+	    //  only update the scan occasionally, reuse cached scan otherwise
+	    int64 now_tick = cv::getTickCount();
+	    double now_s = now_tick / cv::getTickFrequency();
+	    double last_s = (last_scan_tick == 0) ? 0.0 : (last_scan_tick / cv::getTickFrequency());
+
+	    if (last_scan_tick == 0 || (now_s - last_s) >= scan_period_s) {
+	        int64 t0 = cv::getTickCount();
+	        scan_cache = lidar.getScan();
+	        double tscan = (cv::getTickCount() - t0) / cv::getTickFrequency();
+		if(lidar_debug){
+	        std::cout << "[TIMING] lidar.getScan() = " << (tscan * 1000.0) << " ms\n";
+		}
+	        last_scan_tick = now_tick;
+	    }
+
+	    // now assign a lidar distance to each kept detection
+	    for (int id : keep) { // loop over indices that survived nms
+	        Det& d = dets[id]; //get a refernece to that detection
+	        if (d.cls != 0) continue; // only fuse for PERSON class 0, for now anyway Can be adjusted later on
+
+	        float cam_angle = bbox_center_angle(d.box, frame.cols, cam_fov_deg); // convert bbox centre into camera angle in rads
+
+	        // convert cam angle into lidar angle
+	        // lidar sign handle left and right mismatch between camera and lidar coords
+	        // yaw offset hasnt been dealt with as of yet
+	        float lidar_angle = wrap_rad_pm_pi(lidar_sign * cam_angle + deg2radf(lidar_yaw_offset_deg));
+	        // look into lidar scan for points near lidar angle within spec window
+	        //retruns one closest
+	        d.distance_m = distance_from_scan_for_angle(scan_cache, lidar_angle, angle_window_deg, 10.0f);
+	    }
+	} else {
+	    // ensure distance is set to "no lidar" when lidar is disabled
+	    for (int id : keep) dets[id].distance_m = -1.0f;
 	}
 	
-
-
 	// Draw
 	int persons = 0; // count of persons in frame 
 	static int pf = 0;
@@ -278,7 +302,7 @@ std::cout << "[DEBUG] main() start" << std::endl;
 	            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0,255,0), 1);
 	}
 
-        // FPS logging every second 
+        //FPS logging every second 
         frames++; 
         double dt=(getTickCount()-last)/getTickFrequency();
         if(dt>=1.0){ double fps=frames/dt;
