@@ -188,9 +188,12 @@ std::cout << "[DEBUG] main() start" << std::endl;
 // --no display flag , dont open view on screen , increases fps slightly 
 	bool show = true;
 	bool lidar_debug = false;
+	bool bypass_letterbox = false; 
         for (int i = 1; i < argc; ++i) {
         if (string(argv[i]) == "--no-display") show = false;
 	if (string(argv[i]) == "--lidar-debug") lidar_debug = true;
+	if (string(argv[i]) == "--bypass-letterbox") bypass_letterbox = true;
+
     }
 
 
@@ -224,15 +227,23 @@ std::cout << "[DEBUG] main() start" << std::endl;
 // read one fram from camera , break loop if stream ends or frame invalid
         if(!cap.read(frame) || frame.empty()) break; // if frames empty or not read right break from loop 
 
-        // letterbox as defined above to 416x416
-        float ratio; 
-        int top,left; 
-        Mat lb; 
-        letterbox(frame, lb, Size(INP,INP), Scalar(114,114,114), ratio, top, left);
+	// letterbox as defined above to 416x416
+        float ratio = 1.0f; 
+        int top = 0, left = 0; 
+        Mat inp = frame;
+
+        if (!bypass_letterbox) {
+            Mat lb; 
+            letterbox(frame, lb, Size(INP,INP), Scalar(114,114,114), ratio, top, left);
+            inp = lb;
+        } else {
+            // bypass letterbox: assumes pipeline outputs INP×INP already (GPU resize distort path)
+            ratio = 1.0f; top = 0; left = 0;
+            inp = frame;
+        }
 
         // this converts to a blob tensor used by yolo 
-        Mat blob = dnn::blobFromImage(lb, 1/255.0, Size(INP,INP), Scalar(), true, false); // NCHW float32
-
+        Mat blob = dnn::blobFromImage(inp, 1/255.0, Size(INP,INP), Scalar(), true, false); // NCHW float32
         Mat out = trtInfer(blob); // run inference on the blob and retrun a matrix shaped 84xN
 
         // prepare for decoding the output 
@@ -253,8 +264,17 @@ std::cout << "[DEBUG] main() start" << std::endl;
                  if(s>bestp){bestp=s; best=c;} 
                 }
             if(bestp<conf_th) continue; // drop all the weak preditctions 
-            float x=cx-w*0.5f, y=cy-h*0.5f; // this converts from centre to top left coords 
-            float rx=(x-left)/ratio, ry=(y-top)/ratio, rw=w/ratio, rh=h/ratio; // map from letterboxed back to originals, subtract padding, divide byratio
+            float x=cx-w*0.5f, y=cy-h*0.5f; // this converts from centre to top left coords
+            float rx=x, ry=y, rw=w, rh=h; // map from model coords to frame coords
+
+            // if letterbox was used, undo padding+scale to map back to original frame
+            if (!bypass_letterbox) {
+                rx = (x-left)/ratio;
+                ry = (y-top)/ratio;
+                rw = w/ratio;
+                rh = h/ratio;
+            }
+ 
             Rect box = Rect(cvRound(rx),cvRound(ry),cvRound(rw),cvRound(rh)) & Rect(0,0,frame.cols,frame.rows);
             if(box.area()>0) dets.push_back({box,best,bestp}); // keep only valid boxes and store for later fusion 
       }
