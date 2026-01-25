@@ -9,6 +9,7 @@
 #include "lidar_c1.hpp"
 #include <iostream>
 #include <cmath>
+#include <algorithm>
 using namespace cv; using namespace std;
 
 // TRT wrappers from trt_yolo.cpp, called using extern as theyre not defined here 
@@ -47,6 +48,18 @@ float bbox_center_angle(const cv::Rect& box, int img_width, float cam_fov_deg)
 }
 
 
+// Convert an x pixel coordinate into a horizontal angle in radians
+static inline float x_pixel_to_angle(float x_px, int img_width, float cam_fov_deg)
+{
+    float nx = (x_px - img_width / 2.0f) / (img_width / 2.0f);
+
+    const float PI_F = 3.1416f;
+    float half_fov_rad = (cam_fov_deg * PI_F / 180.0f) * 0.5f; // this gives angle from the centre of frame
+
+    return nx * half_fov_rad;
+}
+
+
 // from a lidar scan of loads of angles and distnace points , we need to give best distance near the target angle from cam angle of bbox
 // scan is a vector of all lidar point from this scan, as  (angle_rad, distance_m)
 float distance_from_scan_for_angle(const std::vector<LidarPoint>& scan,
@@ -70,6 +83,53 @@ float distance_from_scan_for_angle(const std::vector<LidarPoint>& scan,
     return best;
 }
 
+// helper for robust lidar dist,  collect all distances within an angular span, trim extremes thrn take median
+float distance_from_scan_for_angle_span_trimmed_median(const std::vector<LidarPoint>& scan,
+                                                       float a0_rad,
+                                                       float a1_rad,
+                                                       float trim_frac = 0.2f,
+                                                       float max_range_m = 12.0f,
+                                                       int min_pts = 5)
+{
+    //  check if angle a is inside [lo, hi] when range might wrap around +-pi
+    auto in_span = [](float a, float lo, float hi) -> bool {
+        if (lo <= hi) return (a >= lo && a <= hi);
+      
+        return (a >= lo || a <= hi);
+    };
+
+    std::vector<float> ds;
+    ds.reserve(scan.size());
+
+    for (const auto& p : scan) {
+        float a = p.first;  // angle of point
+        float d = p.second; // dist of point
+        if (d <= 0.0f || d > max_range_m) continue;
+        if (in_span(a, a0_rad, a1_rad)) ds.push_back(d);
+    }
+
+    if ((int)ds.size() < min_pts) return -1.0f;
+
+    std::sort(ds.begin(), ds.end());
+
+    int n = (int)ds.size();
+    int trim = (int)std::floor(n * trim_frac);
+    int lo = trim;
+    int hi = n - trim; 
+
+    // ensure we still have something left after trimming
+    if (hi - lo < 1) { lo = 0; hi = n; }
+
+    int m = hi - lo;
+    int mid = lo + m / 2;
+
+    // median of trimmed slice
+    if (m % 2 == 1) {
+        return ds[mid];
+    } else {
+        return 0.5f * (ds[mid - 1] + ds[mid]);
+    }
+}
 
 
 // sigmoid helper for models if they output logits , instead of probs 
@@ -252,23 +312,59 @@ std::cout << "[DEBUG] main() start" << std::endl;
 	        last_scan_tick = now_tick;
 	    }
 
+
+
 	    // now assign a lidar distance to each kept detection
 	    for (int id : keep) { // loop over indices that survived nms
 	        Det& d = dets[id]; //get a refernece to that detection
 	        if (d.cls != 0) continue; // only fuse for PERSON class 0, for now anyway Can be adjusted later on
 
-	        float cam_angle = bbox_center_angle(d.box, frame.cols, cam_fov_deg); // convert bbox centre into camera angle in rads
+		// convert bbox left/right edges into camera angles
+		// use only middle band of bbox width so we dont pick up background either side of person
+		// TOdo for this to work i need to make sure lidar and camera are perfectly aligned 
+		float band_frac = 0.10f; // middle 10% - must be 10 now incase of just catching someones head
+		float cx = d.box.x + 0.5f * d.box.width;
+		float half = 0.5f * band_frac * d.box.width;
+		float x0 = cx - half;
+		float x1 = cx + half;
 
-	        // convert cam angle into lidar angle
-	        // lidar sign handle left and right mismatch between camera and lidar coords
-	        // yaw offset hasnt been dealt with as of yet
-	        float lidar_angle = wrap_rad_pm_pi(lidar_sign * cam_angle + deg2radf(lidar_yaw_offset_deg));
-	        // look into lidar scan for points near lidar angle within spec window
-	        //retruns one closest
-	        d.distance_m = distance_from_scan_for_angle(scan_cache, lidar_angle, angle_window_deg, 10.0f);
-	    }
-	} else {
-	    // ensure distance is set to "no lidar" when lidar is disabled
+		// clamp to image bounds
+		if (x0 < 0.0f) x0 = 0.0f;
+		if (x1 > (float)(frame.cols - 1)) x1 = (float)(frame.cols - 1);
+
+		float cam_a0 = x_pixel_to_angle(x0, frame.cols, cam_fov_deg);
+		float cam_a1 = x_pixel_to_angle(x1, frame.cols, cam_fov_deg);
+	        // convert cam angles into lidar angles
+	        float lidar_a0 = wrap_rad_pm_pi(lidar_sign * cam_a0 + deg2radf(lidar_yaw_offset_deg));
+	        float lidar_a1 = wrap_rad_pm_pi(lidar_sign * cam_a1 + deg2radf(lidar_yaw_offset_deg));
+
+	        // small margin to tolerate slight misalignment 
+		// this can more than likely be removed when i create a stable rig 
+	        float margin = deg2radf(2.0f);
+	        lidar_a0 = wrap_rad_pm_pi(lidar_a0 - margin);
+	        lidar_a1 = wrap_rad_pm_pi(lidar_a1 + margin);
+	
+	        //  trimmed median over bbox angular span
+	        float dist = distance_from_scan_for_angle_span_trimmed_median(scan_cache, lidar_a0, lidar_a1, 0.2f, 10.0f, 5);
+
+	        // fallback if not enough points , use old centre window method
+	        if (dist < 0.0f) {
+	            float cam_angle = bbox_center_angle(d.box, frame.cols, cam_fov_deg); // convert bbox centre into camera angle in rads
+
+	            // convert cam angle into lidar angle
+	            // lidar sign handle left and right mismatch between camera and lidar coords
+	            // yaw offset hasnt been dealt with as of yet
+	            float lidar_angle = wrap_rad_pm_pi(lidar_sign * cam_angle + deg2radf(lidar_yaw_offset_deg));
+	            // look into lidar scan for points near lidar angle within spec window
+	            //retruns one closest
+	            dist = distance_from_scan_for_angle(scan_cache, lidar_angle, angle_window_deg, 10.0f);
+	        }
+
+
+	            d.distance_m = dist;
+	    } 
+	} else { 
+	    
 	    for (int id : keep) dets[id].distance_m = -1.0f;
 	}
 	
