@@ -192,6 +192,48 @@ static float wrap_rad_pm_pi(float a) {
     return a;
 }
 
+// these helpers will allow for a symbol be placed on pedestrian to indicate if facing cam or away
+// uses the points on face, if they are in view symbol will will be a nought, if they arent it will be a cross
+// this first helper checks that the points on the body are all in order 
+static inline bool kpt_ok(const Det& d, int idx, float th=0.30f) {
+    return idx >= 0 && idx < (int)d.kpts.size() && d.ksc[idx] >= th;
+}
+
+static void draw_torso_normal_symbol(cv::Mat& img, const Det& d) {
+    const float th = 0.30f;
+    const int LS=5, RS=6, LH=11, RH=12, NOSE=0, LE=1, RE=2;
+
+    if (!(kpt_ok(d,LS,th) && kpt_ok(d,RS,th) && kpt_ok(d,LH,th) && kpt_ok(d,RH,th))) return;
+
+    cv::Point2f S = 0.5f * (d.kpts[LS] + d.kpts[RS]); // shoulder centres 
+
+    // boolean value for if the face is visible or not
+    // confidence thgresholds of each can be finetuned 
+    bool face_visible = kpt_ok(d, NOSE, 0.35f) || (kpt_ok(d,LE,0.35f) && kpt_ok(d,RE,0.35f));
+
+    // fallback is the  confidence imbalance between body sides
+    float right_conf = (d.ksc[RS] + d.ksc[RH]);
+    float left_conf  = (d.ksc[LS] + d.ksc[LH]);
+    bool likely_front = face_visible; 
+    if (!face_visible) {
+        // If one side is consistently lower conf, person is likely turned so we cant know sign reliably
+        // Treat uncertain as facing screen to avoid overconfidence
+        likely_front = false;
+    }
+
+    // draw symbol,  circle + dot  or circle + X 
+    int R = std::max(10, (int)(0.08f * d.box.width));
+    cv::circle(img, S, R, cv::Scalar(0,255,255), 2, cv::LINE_AA);
+
+    if (likely_front) {
+        cv::circle(img, S, std::max(2, R/4), cv::Scalar(0,255,255), -1, cv::LINE_AA); // dot
+    } else {
+        cv::line(img, S + cv::Point2f(-R*0.6f, -R*0.6f), S + cv::Point2f(R*0.6f, R*0.6f),
+                 cv::Scalar(0,255,255), 2, cv::LINE_AA);
+        cv::line(img, S + cv::Point2f(-R*0.6f, R*0.6f), S + cv::Point2f(R*0.6f, -R*0.6f),
+                 cv::Scalar(0,255,255), 2, cv::LINE_AA);
+    }
+}
 
 
 // Entry point
@@ -516,6 +558,9 @@ std::cout << "[DEBUG] main() start" << std::endl;
 	        }
 	    }
 	}
+	   if (!d.kpts.empty()) {   // here we can now draw on the symbol to indicate if they are facing away or not 
+    		draw_torso_normal_symbol(frame, d);
+		}
 
 
 	    if ((++pf % 30) == 0) {
