@@ -12,6 +12,7 @@
 #include <iostream>
 #include <memory>
 #include <vector>
+#include <stdexcept>
 
 using namespace nvinfer1; // remove the need for repeating nvinfer when calling any classes/interfaces in it
 
@@ -116,21 +117,32 @@ public:
         std::vector<float> host(outBytes_ / sizeof(float));
         cudaMemcpy(host.data(), dOut_, outBytes_, cudaMemcpyDeviceToHost);
 
-        // return output as a convenient cv::Mat in shape [84, N] 
-        if (host.size() == static_cast<size_t>(84 * outN_)) {
-          // Create an OpenCV Mat header that views the host vector 
-          // memory as a 84xN float matrix 
-            cv::Mat m(84, outN_, CV_32F, host.data()); 
-            return m.clone(); // clone so returned Mat owns its memory
-        }
 
-        // Fallback, hasnt been needed so far
-        //  if it came out as [N,84] transpose to [84,N]
-        int rows = static_cast<int>(host.size() / 84);
-        cv::Mat raw(rows, 84, CV_32F, host.data());
-        cv::Mat t;
-        cv::transpose(raw, t);
-        return t.clone();
+       // Return output as cv::Mat(C, N) regardless of whether engine gives [C,N] or [N,C]
+	if (outC_ <= 0 || outN_ <= 0) {
+	    throw std::runtime_error("inferOutN() did not set outC_/outN_");
+	}
+
+	if (host.size() != static_cast<size_t>(outC_ * outN_)) {
+	    std::cerr << "[TRT] Unexpected output size. host floats=" << host.size()
+	              << " expected=" << (outC_ * outN_) << " (C=" << outC_ << " N=" << outN_ << ")\n";
+	    return cv::Mat();
+	}
+
+	if (outIsCN_) {
+	    // [C, N]
+	    cv::Mat m(outC_, outN_, CV_32F, host.data());
+	    return m.clone();
+	} else {
+	    // [N, C] -> transpose to [C, N]
+	    cv::Mat raw(outN_, outC_, CV_32F, host.data());
+	    cv::Mat t;
+	    cv::transpose(raw, t); // now (C, N)
+	    return t.clone();
+	}
+       
+
+
     }
 
 private:
@@ -151,7 +163,9 @@ private:
     void* dIn_  = nullptr;
     void* dOut_ = nullptr;
 
-    int outN_ = 8400; // default for common yolos 
+    int outC_ = 0;        // channels per candidate 84 for coco yolos, 56 for pose 
+    int outN_ = 0;        // number of candidates 
+    bool outIsCN_ = true; // true if output is [1,C,N] ,  false if [1,N,C] - different for diff yolos 
 
 private:
     // readfile helper loads the .plan bytes , just to be used in thisfile
@@ -202,15 +216,54 @@ private:
         cudaMalloc(&dOut_, outBytes_);
     }
 
-    void inferOutN() {
-        // reads the output tensor shape for outp binding
-        // just finds N from the shape of the tensor 
-        Dims out = engine_->getBindingDimensions(outBinding_);
-        if (out.nbDims == 3) { //check 3 dimensions 
-            if (out.d[1] == 84) outN_ = out.d[2]; // make sure index 1 = 84
-            else if (out.d[2] == 84) outN_ = out.d[1]; //otherwise if dim2 is 84 shape is [1,N,84] so N is dim1
-        }
-    }
+	void inferOutN() {
+	    Dims out = engine_->getBindingDimensions(outBinding_);
+
+	    // Common cases:
+	    //  - [1, C, N]  (outIsCN_=true)
+	    //  - [1, N, C]  (outIsCN_=false)
+	    //  - [C, N] or [N, C]
+	    if (out.nbDims == 3) {
+	        int d1 = out.d[1];
+	        int d2 = out.d[2];
+	
+	        if (d1 <= 0 || d2 <= 0) throw std::runtime_error("Output dims invalid");
+
+	        // Usually N >> C, so bigger dim is N.
+	        if (d1 > d2) { // [1, N, C]
+	            outIsCN_ = false;
+	            outN_ = d1;
+	            outC_ = d2;
+	        } else {       // [1, C, N]
+	            outIsCN_ = true;
+	            outC_ = d1;
+	            outN_ = d2;
+	        }
+	        return;
+	    }
+
+	    if (out.nbDims == 2) {
+	        int d0 = out.d[0];
+	        int d1 = out.d[1];
+	
+	        if (d0 <= 0 || d1 <= 0) throw std::runtime_error("Output dims invalid");
+	
+	        if (d0 > d1) { // [N, C]
+		            outIsCN_ = false;
+	            outN_ = d0;
+	            outC_ = d1;
+	        } else {       // [C, N]
+	            outIsCN_ = true;
+	            outC_ = d0;
+	            outN_ = d1;
+	        }
+	        return;
+	    }
+
+	    throw std::runtime_error("Unexpected output nbDims=" + std::to_string(out.nbDims));
+	}
+
+
 };
 
 

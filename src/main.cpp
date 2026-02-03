@@ -10,6 +10,7 @@
 #include <iostream>
 #include <cmath>
 #include <algorithm>
+#include <vector>
 using namespace cv; using namespace std;
 
 // TRT wrappers from trt_yolo.cpp, called using extern as theyre not defined here 
@@ -22,7 +23,31 @@ extern "C" void trtInit(const std::string& plan);
 // cls = predicted class index (COCO)
 // score = confidence score for each class 
 // distance_m now added to be filled after the rest from lidar data 
-struct Det { Rect box; int cls; float score; float distance_m = -1.0f; };
+
+// now added - pose models output keypoints 
+struct Det {
+    Rect box;
+    int cls;
+    float score;
+    float distance_m = -1.0f;
+
+    // Pose keypoints
+    std::vector<cv::Point2f> kpts;   // size 17 - keypoints XY
+    std::vector<float>       ksc;    // size 17 - conf of keypoitns 
+};
+
+// COCO17 skeleton pairs   
+// these points describe how everythin connects for drawing stage
+static const int COCO17_PAIRS[][2] = {
+    {5,7},{7,9},      // left arm
+    {6,8},{8,10},     // right arm
+    {11,13},{13,15},  // left leg
+    {12,14},{14,16},  // right leg
+    {5,6},{5,11},{6,12},{11,12}, // torso
+    {0,1},{0,2},{1,3},{2,4},      // face
+    {0,5},{0,6}       // head to shoulders
+};
+static const int COCO17_NUM_PAIRS = sizeof(COCO17_PAIRS) / sizeof(COCO17_PAIRS[0]);
 
 bool use_lidar = true;
 
@@ -204,11 +229,11 @@ std::cout << "[DEBUG] main() start" << std::endl;
 //conf = confidence thresh to keep a det
 //nms_th = IoU thresh for nms 
     const int INP=416; 
-    const float conf_th=0.25f, 
+    const float conf_th=0.1f, 
     nms_th=0.5f;
 // load trt engine , done once and reused all frames
   std::cout << "[DEBUG] before trtInit" << std::endl;
-    trtInit("/home/sean/models/yolov8n/yolov8n_fp16.plan"); // init using the .plan file path
+    trtInit("/home/sean/models/yolov8n/yolov8n_pose_416_fp16.plan"); // init using the .plan file path
 
 	 
     LidarC1 lidar("/dev/ttyUSB0", 460800);     // start the lidar 
@@ -246,38 +271,105 @@ std::cout << "[DEBUG] main() start" << std::endl;
         Mat blob = dnn::blobFromImage(inp, 1/255.0, Size(INP,INP), Scalar(), true, false); // NCHW float32
         Mat out = trtInfer(blob); // run inference on the blob and retrun a matrix shaped 84xN
 
-        // prepare for decoding the output 
-        const int N = out.cols;   // N is the number of candidate predictions 
-        const float* p = (float*)out.data; //p points to the raw float data inside out
-        vector<Det> dets; // dets will store decoded detections
-        dets.reserve(N); // this avoids reallocations 
 
-        for(int i=0;i<N;i++){
-            // for every candidate get the box coordinates centre x and y and wdith and height 
-            float cx=p[0*N+i], cy=p[1*N+i], w=p[2*N+i], h=p[3*N+i];
-            int best=-1; // best class id
-            float bestp=0.f; // best class confidence 
-            // this loop then assigns the best suited label from 80 COCO 
-            for(int c=0;c<80;c++){
-                 float s=p[(4+c)*N+i]; 
-                 //if(s<0||s>1) s=sigmoid(s); 
-                 if(s>bestp){bestp=s; best=c;} 
-                }
-            if(bestp<conf_th) continue; // drop all the weak preditctions 
-            float x=cx-w*0.5f, y=cy-h*0.5f; // this converts from centre to top left coords
-            float rx=x, ry=y, rw=w, rh=h; // map from model coords to frame coords
+	// prepare for decoding the output
+ 	// pose only looks for humans so no need for coco80 classes anymore
+	// it now has 56 channels , 17 points x 3 = 51 , + 4 coords for box , + 1 overall conf
+	const int N = out.cols;          // number of candidates
+	const int C = out.rows;          // channels per candidate - 84 for detect, 56 for pose
+	const float* p = (const float*)out.data;
 
-            // if letterbox was used, undo padding+scale to map back to original frame
-            if (!bypass_letterbox) {
-                rx = (x-left)/ratio;
-                ry = (y-top)/ratio;
-                rw = w/ratio;
-                rh = h/ratio;
-            }
- 
-            Rect box = Rect(cvRound(rx),cvRound(ry),cvRound(rw),cvRound(rh)) & Rect(0,0,frame.cols,frame.rows);
-            if(box.area()>0) dets.push_back({box,best,bestp}); // keep only valid boxes and store for later fusion 
-      }
+	static bool printed_shape = false;
+	if (!printed_shape) {
+	    std::cout << "[DEBUG] TRT out shape: rows=" << C << " cols=" << N << std::endl;
+	    printed_shape = true;
+	}
+
+	vector<Det> dets;
+	dets.reserve(N);
+
+	for (int i = 0; i < N; i++) {
+	    //the box coords  are always the first 4 channels
+	    float cx = p[0 * N + i];
+	    float cy = p[1 * N + i];
+	    float w  = p[2 * N + i];
+	    float h  = p[3 * N + i];
+		
+		// pose here is only human, so class id is fixed at 0
+		// confidence read from channel 4
+	    int   best  = 0;
+	    float bestp = 0.f;
+		// left in here the previous decode for yolov8n model in case of swithcing back 
+	    if (C == 84) {
+	        // YOLOv8 detect  4 + 80 class scores
+	        best = -1;
+	        bestp = 0.f;
+	        for (int c = 0; c < 80; c++) {
+	            float s = p[(4 + c) * N + i];
+	            if (s > bestp) { bestp = s; best = c; }
+	        }
+	        if (bestp < conf_th) continue;
+	    } else {
+	        // pose = 56
+	        best  = 0;                 // person
+	        bestp = p[4 * N + i];      // person confidence
+	        if (bestp < conf_th) continue;
+	    }
+
+	    // convert from center to top-left in model coords
+	    float x = cx - w * 0.5f;
+	    float y = cy - h * 0.5f;
+
+	    float rx = x, ry = y, rw = w, rh = h;
+
+	    // if letterbox was used, undo padding+scale to map back to original frame
+	    if (!bypass_letterbox) {
+	        rx = (x - left) / ratio;
+	        ry = (y - top)  / ratio;
+	        rw = w / ratio;
+	        rh = h / ratio;
+	    }
+	    Rect box = Rect(cvRound(rx), cvRound(ry), cvRound(rw), cvRound(rh)) &
+	           Rect(0, 0, frame.cols, frame.rows);
+
+	   if (box.area() > 0) {
+	    Det d;
+	    d.box = box;
+	    d.cls = best;
+	    d.score = bestp;
+
+	    // If pose output, extract keypoints and store them 
+	    // 	keypoints are stored as x, y , score... starting at channel 5
+            // also has to under padding or letterbox for keypoints same as bboxes
+	    if (C >= 56 && best == 0) {
+	        const int kpt_start = 5;
+	        const int kpt_step  = 3;
+	        const int num_kpts  = (C - kpt_start) / kpt_step;  // expect 17
+	
+	        d.kpts.assign(num_kpts, cv::Point2f(-1, -1));
+	        d.ksc.assign(num_kpts, 0.0f);
+
+	        for (int k = 0; k < num_kpts; k++) {
+	            float kx = p[(kpt_start + k * kpt_step + 0) * N + i];
+	            float ky = p[(kpt_start + k * kpt_step + 1) * N + i];
+	            float ks = p[(kpt_start + k * kpt_step + 2) * N + i];
+
+	            // map back to original frame if letterbox used
+	            float fx = kx, fy = ky;
+	            if (!bypass_letterbox) {
+	                fx = (kx - left) / ratio;
+	                fy = (ky - top)  / ratio;
+	            }
+
+	            d.kpts[k] = cv::Point2f(fx, fy);
+	            d.ksc[k]  = ks;
+	        }
+	    }
+	
+	    dets.push_back(std::move(d));
+	}
+	
+}
 
 	// NMS
     // first sort the candidates by highest conf 
@@ -400,6 +492,31 @@ std::cout << "[DEBUG] main() start" << std::endl;
 	    float cam_angle = bbox_center_angle(d.box, frame.cols, cam_fov_deg);
 
 	    cv::rectangle(frame, d.box, cv::Scalar(0,255,0), 2); // draw bounding box in green 
+	    
+	   // drawing on keypoints here 
+           // connects the lines using the coco17_pairs from above 
+	   if (C >= 56 && !d.kpts.empty()) {
+	    const float kpt_th = 0.30f;
+
+	    // draw keypoints
+	    for (int k = 0; k < (int)d.kpts.size(); k++) {
+	        if (d.ksc[k] >= kpt_th) {
+	            cv::circle(frame, d.kpts[k], 3, cv::Scalar(0, 0, 255), -1);
+	        }
+	    }
+
+	    // draw skeleton lines
+	    for (int pi = 0; pi < COCO17_NUM_PAIRS; pi++) {
+	        int a = COCO17_PAIRS[pi][0];
+	        int b = COCO17_PAIRS[pi][1];
+	        if (a < 0 ||  b < 0 ||  a >= (int)d.kpts.size() || b >= (int)d.kpts.size()) continue;
+	
+	        if (d.ksc[a] >= kpt_th && d.ksc[b] >= kpt_th) {
+	            cv::line(frame, d.kpts[a], d.kpts[b], cv::Scalar(255, 0, 0), 2);
+	        }
+	    }
+	}
+
 
 	    if ((++pf % 30) == 0) {
 	        std::cout << "[FUSE] det_angle_deg=" << (cam_angle * 180.0f / 3.14159265f)
