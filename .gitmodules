@@ -1,0 +1,3 @@
+[submodule "external/ByteTrack-cpp"]
+	path = external/ByteTrack-cpp
+	url = https://github.com/Vertical-Beach/ByteTrack-cpp.git
