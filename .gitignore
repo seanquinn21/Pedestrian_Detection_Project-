@@ -7,3 +7,5 @@ cmake-build-*/
 *.cache
 *.plan
 *.onnx
+
+videos/
