@@ -271,12 +271,20 @@ private:
 static std::unique_ptr<TRTEngine> gEngine;
 
 extern "C" void trtInit(const std::string& plan) {
-   // Create / replace the global engine object by loading the .plan file and allocating buffers
-    gEngine.reset(new TRTEngine(plan));
+    try {
+        std::cerr << "[TRT] Loading plan: " << plan << std::endl;
+        gEngine.reset(new TRTEngine(plan));
+        std::cerr << "[TRT] Engine loaded OK" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "[TRT] trtInit failed: " << e.what() << std::endl;
+        gEngine.reset();
+    }
 }
 
 extern "C" cv::Mat trtInfer(const cv::Mat& blob) {
-  // Run one inference using the global engine and return the raw output tensor
+    if (!gEngine) {
+        std::cerr << "[TRT] trtInfer called but engine is null\n";
+        return cv::Mat();
+    }
     return gEngine->infer(blob);
 }
-

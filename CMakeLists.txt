@@ -27,6 +27,10 @@ list(FILTER RPLIDAR_SDK_SRC EXCLUDE REGEX "./arch/arduino/.")
 
 list(LENGTH RPLIDAR_SDK_SRC RPLIDAR_SDK_SRC_LEN)
 
+set(BUILD_BYTETRACK_TEST OFF CACHE BOOL "" FORCE)   # disable tests
+add_subdirectory(external/ByteTrack-cpp)
+
+
 
 add_executable(avdet
   src/main.cpp
@@ -39,9 +43,12 @@ target_include_directories(avdet PRIVATE
   ${RPLIDAR_SDK_DIR}/include
   ${RPLIDAR_SDK_DIR}/src
 )
+target_include_directories(avdet PRIVATE /usr/include/eigen3)
+
 # Opencv , Trt and Cuda runtime , threads and realtime 
 target_link_libraries(avdet PRIVATE
   ${OpenCV_LIBS}
   nvinfer nvonnxparser cudart 
   pthread rt
+  bytetrack
 )

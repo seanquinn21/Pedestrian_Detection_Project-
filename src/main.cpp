@@ -11,6 +11,12 @@
 #include <cmath>
 #include <algorithm>
 #include <vector>
+#include <memory>
+#include "ByteTrack/BYTETracker.h"
+#include "ByteTrack/Object.h"
+#include "ByteTrack/Rect.h"
+#include "ByteTrack/STrack.h"
+
 using namespace cv; using namespace std;
 
 // TRT wrappers from trt_yolo.cpp, called using extern as theyre not defined here 
@@ -236,6 +242,40 @@ static void draw_torso_normal_symbol(cv::Mat& img, const Det& d) {
 }
 
 
+
+// helper to convert ByteTrack recangle to  cv::Rect 
+static inline cv::Rect btrect_to_cv(const byte_track::Rect<float>& r, int W, int H) {
+    int x = (int)std::round(r.x());
+    int y = (int)std::round(r.y());
+    int w = (int)std::round(r.width());
+    int h = (int)std::round(r.height());
+    cv::Rect box(x, y, w, h);
+    return box & cv::Rect(0, 0, W, H);
+}
+
+static inline float iou_rect(const cv::Rect& a, const cv::Rect& b) {
+    float inter = (float)(a & b).area();
+    float uni = (float)(a.area() + b.area() - inter) + 1e-6f;
+    return inter / uni;
+}
+
+// match a track bbox to the best detection bbox this frame (to reuse pose and lidar distance)
+static int match_det_by_iou(const cv::Rect& tbox, const std::vector<Det>& dets,
+                            float min_iou = 0.3f) {
+    int best = -1;
+    float best_i = min_iou;
+    for (int i = 0; i < (int)dets.size(); i++) {
+        if (dets[i].cls != 0) continue; 
+        float iou = iou_rect(tbox, dets[i].box);
+        if (iou > best_i) { best_i = iou; best = i; }
+    }
+    return best;
+}
+
+
+
+
+
 // Entry point
 //  open camera , initialise TRT engine,
 //  process frames in a loop
@@ -247,42 +287,87 @@ std::cout << "[DEBUG] main() start" << std::endl;
 // GStreamer pipeline used by opencv video capturing
  // If a pipeline string is passed as argv[1], use that, otherwise use default CSI camera pipeline
 // done this incase pipeline is chnaged later in proj 
-    string pipe = (argc>1)? argv[1] :
-        "nvarguscamerasrc ! video/x-raw(memory:NVMM),width=640,height=480,framerate=30/1,format=NV12 "
-        "! nvvidconv ! video/x-raw,format=BGRx ! videoconvert ! video/x-raw,format=BGR "
-        "! appsink drop=1 max-buffers=1";
 
-// --no display flag , dont open view on screen , increases fps slightly 
+	cv::VideoCapture cap;
+
+	if (argc > 1) {
+	    std::string src = argv[1];
+
+	    if (src.find("!") != std::string::npos) {
+	        // GStreamer pipeline (from run.sh)
+	        cap.open(src, cv::CAP_GSTREAMER);
+	    } else {
+	        // Video file path -> use GStreamer with a proper URI
+	        std::string uri = "file://" + src;
+		std::string gst =
+   		 "filesrc location=" + src +
+		    " ! qtdemux ! h264parse ! avdec_h264 "
+		    " ! videoconvert ! video/x-raw,format=BGR "
+		    " ! appsink drop=1 max-buffers=1";
+		cap.open(gst, cv::CAP_GSTREAMER);
+	    }
+	} else {
+	    std::string default_pipe =
+	        "nvarguscamerasrc ! video/x-raw(memory:NVMM),width=640,height=480,framerate=30/1,format=NV12 "
+	        "! nvvidconv ! video/x-raw,format=BGRx ! videoconvert ! video/x-raw,format=BGR "
+	        "! appsink drop=1 max-buffers=1";
+	    cap.open(default_pipe, cv::CAP_GSTREAMER);
+	}
+
+	if(!cap.isOpened()){
+	    std::cerr << "Failed to open video source\n";
+	    return -1;
+	}
+	
+	
+
+	// --no display flag , dont open view on screen , increases fps slightly 
 	bool show = true;
 	bool lidar_debug = false;
-	bool bypass_letterbox = false; 
+	bool bypass_letterbox = false;
+	bool disable_lidar = false; 
         for (int i = 1; i < argc; ++i) {
         if (string(argv[i]) == "--no-display") show = false;
 	if (string(argv[i]) == "--lidar-debug") lidar_debug = true;
 	if (string(argv[i]) == "--bypass-letterbox") bypass_letterbox = true;
+	if (string(argv[i]) == "--no-lidar") disable_lidar = true;
 
     }
 
 
-    VideoCapture cap(pipe, CAP_GSTREAMER);
-    if(!cap.isOpened()){ cerr<<"Failed to open CSI camera via GStreamer\n"; return -1; } // just print an error in case it doesnt open right
  std::cout << "[DEBUG] camera opened OK" << std::endl;
 // inp use 416 network input size 
 //conf = confidence thresh to keep a det
 //nms_th = IoU thresh for nms 
     const int INP=416; 
-    const float conf_th=0.1f, 
+    const float conf_th=0.15f, 
     nms_th=0.5f;
 // load trt engine , done once and reused all frames
   std::cout << "[DEBUG] before trtInit" << std::endl;
     trtInit("/home/sean/models/yolov8n/yolov8n_pose_416_fp16.plan"); // init using the .plan file path
-
-	 
-    LidarC1 lidar("/dev/ttyUSB0", 460800);     // start the lidar 
-    std::cout << "[DEBUG] after trtInit" << std::endl;
-
     
+    // ByteTrack tracker from pulled repo 
+byte_track::BYTETracker tracker(
+    30,   // frame_rate
+    60,   // track_buffer
+    0.15f, // track_thresh
+    0.25f, // high_thresh
+    0.8f  // match_thresh
+);
 
+std::cout << "[DEBUG] after trtInit (before lidar)" << std::endl;
+
+// optional lidar (only constructed if enabled)
+std::unique_ptr<LidarC1> lidar;
+
+if (use_lidar && !disable_lidar) {
+    std::cout << "[DEBUG] initialising lidar" << std::endl;
+    lidar = std::make_unique<LidarC1>("/dev/ttyUSB0", 460800);
+    std::cout << "[DEBUG] after lidar init" << std::endl;
+} else {
+    std::cout << "[DEBUG] lidar disabled" << std::endl;
+}
+   
 
 // main procesing loop - grab frame , run inference , postprocess, draw and log fps
     Mat frame; //opencv container called frame, each loop cap.read(frame) will fill this 
@@ -439,6 +524,32 @@ std::cout << "[DEBUG] main() start" << std::endl;
 	    }
 	}
 	
+
+	// DEBUG stage ---  draw raw detections beofre bytetrack to see if YOLO is actually detecting them
+for (int id : keep) {
+    const Det& d = dets[id];
+    if (d.cls != 0) continue;
+    cv::rectangle(frame, d.box, cv::Scalar(0,0,255), 2); // red raw dets
+    putText(frame, cv::format("DET %.2f", d.score), d.box.tl() + cv::Point(0,-3),
+            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0,0,255), 1);
+}
+
+
+	
+	// update bytetraxck
+	std::vector<byte_track::Object> objects;
+	objects.reserve(keep.size());
+
+	for (int id : keep) {
+	    const Det& d = dets[id];
+	    if (d.cls != 0) continue; // track only people 
+	    byte_track::Rect<float> r((float)d.box.x, (float)d.box.y,
+	                             (float)d.box.width, (float)d.box.height);
+	    objects.emplace_back(r, d.cls, d.score);
+	}
+
+	std::vector<byte_track::BYTETracker::STrackPtr> tracks = tracker.update(objects);
+
 	const float cam_fov_deg = 62.0f; // cam angle from rpi docs 
         const float angle_window_deg = 3.0f; // this is the window around the centre of bbox we can search for points in 
 
@@ -450,7 +561,7 @@ std::cout << "[DEBUG] main() start" << std::endl;
 	double scan_period_s = 0.10;               
 
 	// grab a lidar scan for this frame
-	if(use_lidar){	
+	if(use_lidar && lidar){	
 	    //  only update the scan occasionally, reuse cached scan otherwise
 	    int64 now_tick = cv::getTickCount();
 	    double now_s = now_tick / cv::getTickFrequency();
@@ -458,7 +569,7 @@ std::cout << "[DEBUG] main() start" << std::endl;
 
 	    if (last_scan_tick == 0 || (now_s - last_s) >= scan_period_s) {
 	        int64 t0 = cv::getTickCount();
-	        scan_cache = lidar.getScan();
+	        scan_cache = lidar->getScan();
 	        double tscan = (cv::getTickCount() - t0) / cv::getTickFrequency();
 		if(lidar_debug){
 	        std::cout << "[TIMING] lidar.getScan() = " << (tscan * 1000.0) << " ms\n";
@@ -523,62 +634,78 @@ std::cout << "[DEBUG] main() start" << std::endl;
 	}
 	
 	// Draw
-	int persons = 0; // count of persons in frame 
-	static int pf = 0;
+    int persons = 0; // count of persons in frame 
+    static int pf = 0;
 
-	for (int id : keep) { // loop over kept detectiosn
-	    Det& d = dets[id];
-	    if (d.cls != 0) continue; // onlt apply to people 
-	    persons++;
+    for (const auto& tp : tracks) { // loop over tracked persons
+        if (!tp || !tp->isActivated()) continue;
+        if (tp->getSTrackState() != byte_track::STrackState::Tracked) continue;
+
+        cv::Rect tbox = btrect_to_cv(tp->getRect(), frame.cols, frame.rows);
+        if (tbox.area() <= 0) continue;
+
+        persons++;
+
+        // Attach this track to a Det this frame (reuse pose + lidar distance)
+        int di = match_det_by_iou(tbox, dets, 0.3f);
+        if (di < 0) continue;
+
+        Det& d = dets[di];
+        if (d.cls != 0) continue; // onlt apply to people 
+
         // bbox centre into angle 
-	    float cam_angle = bbox_center_angle(d.box, frame.cols, cam_fov_deg);
+        float cam_angle = bbox_center_angle(d.box, frame.cols, cam_fov_deg);
 
-	    cv::rectangle(frame, d.box, cv::Scalar(0,255,0), 2); // draw bounding box in green 
-	    
-	   // drawing on keypoints here 
-           // connects the lines using the coco17_pairs from above 
-	   if (C >= 56 && !d.kpts.empty()) {
-	    const float kpt_th = 0.30f;
+        cv::rectangle(frame, tbox, cv::Scalar(0,255,0), 2); // draw bounding box in green 
 
-	    // draw keypoints
-	    for (int k = 0; k < (int)d.kpts.size(); k++) {
-	        if (d.ksc[k] >= kpt_th) {
-	            cv::circle(frame, d.kpts[k], 3, cv::Scalar(0, 0, 255), -1);
-	        }
-	    }
+        // draw track id
+        putText(frame, cv::format("ID:%zu", tp->getTrackId()), tbox.tl() + cv::Point(0,-20),
+                cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0,255,255), 2);
 
-	    // draw skeleton lines
-	    for (int pi = 0; pi < COCO17_NUM_PAIRS; pi++) {
-	        int a = COCO17_PAIRS[pi][0];
-	        int b = COCO17_PAIRS[pi][1];
-	        if (a < 0 ||  b < 0 ||  a >= (int)d.kpts.size() || b >= (int)d.kpts.size()) continue;
-	
-	        if (d.ksc[a] >= kpt_th && d.ksc[b] >= kpt_th) {
-	            cv::line(frame, d.kpts[a], d.kpts[b], cv::Scalar(255, 0, 0), 2);
-	        }
-	    }
-	}
-	   if (!d.kpts.empty()) {   // here we can now draw on the symbol to indicate if they are facing away or not 
-    		draw_torso_normal_symbol(frame, d);
-		}
+        // drawing on keypoints here 
+        // connects the lines using the coco17_pairs from above 
+        if (C >= 56 && !d.kpts.empty()) {
+            const float kpt_th = 0.30f;
 
+            // draw keypoints
+            for (int k = 0; k < (int)d.kpts.size(); k++) {
+                if (d.ksc[k] >= kpt_th) {
+                    cv::circle(frame, d.kpts[k], 3, cv::Scalar(0, 0, 255), -1);
+                }
+            }
 
-	    if ((++pf % 30) == 0) {
-	        std::cout << "[FUSE] det_angle_deg=" << (cam_angle * 180.0f / 3.14159265f)
-	                  << " dist=" << d.distance_m << "m\n";
-	    }
+            // draw skeleton lines
+            for (int pi = 0; pi < COCO17_NUM_PAIRS; pi++) {
+                int a = COCO17_PAIRS[pi][0];
+                int b = COCO17_PAIRS[pi][1];
+                if (a < 0 ||  b < 0 ||  a >= (int)d.kpts.size() || b >= (int)d.kpts.size()) continue;
+
+                if (d.ksc[a] >= kpt_th && d.ksc[b] >= kpt_th) {
+                    cv::line(frame, d.kpts[a], d.kpts[b], cv::Scalar(255, 0, 0), 2);
+                }
+            }
+        }
+        if (!d.kpts.empty()) {   // here we can now draw on the symbol to indicate if they are facing away or not 
+            draw_torso_normal_symbol(frame, d);
+        }
+
+        if ((++pf % 30) == 0) {
+            std::cout << "[FUSE] det_angle_deg=" << (cam_angle * 180.0f / 3.14159265f)
+                      << " dist=" << d.distance_m << "m\n";
+        }
 
         // adding the distance measured onto the frame for visual display 
-	    std::string label;
-	    if (d.distance_m > 0.0f) // if there s distnace present display it 
-	        label = cv::format("%d %.2f %.1fm", d.cls, d.score, d.distance_m);
-	    else
-	        label = cv::format("%d %.2f", d.cls, d.score);
-        
-            //put all on frame 
-	    putText(frame, label, d.box.tl() + cv::Point(0,-3),
-	            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0,255,0), 1);
-	}
+        std::string label;
+        if (d.distance_m > 0.0f) // if there s distnace present display it 
+            label = cv::format("ID:%zu %.2f %.1fm", tp->getTrackId(), d.score, d.distance_m);
+        else
+            label = cv::format("ID:%zu %.2f", tp->getTrackId(), d.score);
+
+        //put all on frame 
+        putText(frame, label, tbox.tl() + cv::Point(0,-3),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0,255,0), 1);
+    }
+
 
         //FPS logging every second 
         frames++; 
@@ -591,7 +718,9 @@ std::cout << "[DEBUG] main() start" << std::endl;
         }
 	// display annotated frame in a window 
         if(show){
-            imshow("avdet", frame);
+	    cv::Mat disp;
+            cv::resize(frame, disp, cv::Size(), 0.5, 0.5);  // 50% scale
+            imshow("avdet", disp);
             if(waitKey(1)==27) break;
         }
         
