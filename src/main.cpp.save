@@ -16,25 +16,12 @@
 #include "ByteTrack/Object.h"
 #include "ByteTrack/Rect.h"
 #include "ByteTrack/STrack.h"
-#include "lane/lane_detector.hpp"
-// REMOVED segNet - replaced with trapezoid road regio
-// since replaced with canny detector 
-// #include <jetson-inference/segNet.h>
-// #include <jetson-utils/cudaMappedMemory.h>
-// #include <jetson-utils/cudaResize.h>
-// #include <jetson-utils/cudaOverlay.h>
-// #include <cuda_runtime.h>
+#include <jetson-inference/segNet.h>
+#include <jetson-utils/cudaMappedMemory.h>
+#include <jetson-utils/cudaResize.h>
+#include <jetson-utils/cudaOverlay.h>
+#include <cuda_runtime.h>
 using namespace cv; using namespace std;
-
-// Trapezoid road region: 4 points (bottom-left, bottom-right, top-right, top-left)
-// Normalized 0-1: x=0 left, x=1 right; y=0 top, y=1 bottom
-static std::vector<cv::Point2f> roadTrapezoid;  // filled on first frame
-static bool trapezoidInitialized = false;
-static bool pointInRoadTrapezoid(int x, int y, int imgW, int imgH) {
-    if (roadTrapezoid.size() != 4) return false;
-    cv::Point2f pt((float)x, (float)y);
-    return cv::pointPolygonTest(roadTrapezoid, pt, false) >= 0;
-}
 
 // TRT wrappers from trt_yolo.cpp, called using extern as theyre not defined here 
 // init loads engine and allocates gpu buffers 
@@ -290,6 +277,9 @@ static int match_det_by_iou(const cv::Rect& tbox, const std::vector<Det>& dets,
 }
 
 
+
+
+
 // Entry point
 //  open camera , initialise TRT engine,
 //  process frames in a loop
@@ -354,22 +344,40 @@ std::cout << "[DEBUG] main() start" << std::endl;
 //conf = confidence thresh to keep a det
 //nms_th = IoU thresh for nms 
     const int INP=416; 
-    const float conf_th=0.25f, 
+    const float conf_th=0.15f, 
     nms_th=0.5f;
 // load trt engine , done once and reused all frames
   std::cout << "[DEBUG] before trtInit" << std::endl;
-    trtInit("/home/sean/models/yolov8n/yolov8s_pose_416_fp16.plan"); // init using the .plan file path
+    trtInit("/home/sean/models/yolov8n/yolov8n_pose_416_fp16.plan"); // init using the .plan file path
 
+segNet* seg = nullptr;
 
+{
+    // IMPORTANT:
+    // --model-dir must be the folder that CONTAINS "networks/models.json"
+    // so point it to ".../jetson-inference/data" (not ".../data/networks")
+char* seg_argv[] = {
+    (char*)"avdet",
+    (char*)"--network=fcn-resnet18-cityscapes-512x256",
+    (char*)"--alpha=150"
+};
+int seg_argc = 3;
+
+    seg = segNet::Create(seg_argc, seg_argv);
+    if (!seg) {
+        std::cerr << "Failed to create segNet\n";
+        return -1;
+    }
+}
 
 
     // ByteTrack tracker from pulled repo 
 byte_track::BYTETracker tracker(
     30,   // frame_rate
-    90,   // track_buffer
-    0.20f, // track_thresh
+    60,   // track_buffer
+    0.15f, // track_thresh
     0.25f, // high_thresh
-    0.65f  // match_thresh
+    0.8f  // match_thresh
 );
 
 std::cout << "[DEBUG] after trtInit (before lidar)" << std::endl;
@@ -384,16 +392,10 @@ if (use_lidar && !disable_lidar) {
 } else {
     std::cout << "[DEBUG] lidar disabled" << std::endl;
 }
-
-// Lane detector 
-lane::LaneConfig lane_cfg;
-lane_cfg.update_every_n = 3;  // how many frames between each time  we run the detector 
-lane_cfg.ema_alpha = 0.20f;  // for ema smoothing 
-lane::LaneDetector lane_detector(lane_cfg);
+   
 
 // main procesing loop - grab frame , run inference , postprocess, draw and log fps
     Mat frame; //opencv container called frame, each loop cap.read(frame) will fill this 
-    int frame_idx = 0;
     int frames=0; // counter for how many frame sprocessed 
     int64 last=getTickCount(); //timer for process used ltaer on 
     
@@ -401,12 +403,20 @@ lane::LaneDetector lane_detector(lane_cfg);
     while(true){
 // read one fram from camera , break loop if stream ends or frame invalid
         if(!cap.read(frame) || frame.empty()) break; // if frames empty or not read right break from loop 
+	
+	static uchar3* cudaInput  = nullptr;
+        static uchar3* cudaOutput = nullptr;
+        static int segW = 0, segH = 0;
 
-        frame_idx++;
-        lane::LaneEstimate lane_est = lane_detector.update(frame, frame_idx, {}, nullptr);
-        lane_detector.drawOverlay(frame, lane_est, /*fill_lane=*/true, /*draw_roi=*/false);
+        if (!cudaInput || segW != frame.cols || segH != frame.rows) {
+            segW = frame.cols;
+            segH = frame.rows;
 
-
+            cudaAllocMapped((void**)&cudaInput,
+                            segW * segH * sizeof(uchar3));
+            cudaAllocMapped((void**)&cudaOutput,
+                            segW * segH * sizeof(uchar3));
+        }
 
 	// letterbox as defined above to 416x416
         float ratio = 1.0f; 
@@ -558,7 +568,16 @@ lane::LaneDetector lane_detector(lane_cfg);
 for (int id : keep) {
     const Det& d = dets[id];
     if (d.cls != 0) continue;
-    cv::rectangle(frame, d.box, cv::Scalar(0,0,255), 2); // red raw dets
+    // Check if pedestrian center is on road (for tracking pedestrians entering road)
+        int cx = tbox.x + tbox.width / 2;
+        int cy = tbox.y + tbox.height / 2;
+        bool onRoad = false;
+        if (roadMaskValid && cx >= 0 && cx < roadMask.cols && cy >= 0 && cy < roadMask.rows) {
+            if (roadMask.at<uint8_t>(cy, cx) == 255) onRoad = true;
+        }
+
+        // draw bbox: red if on road, green otherwise
+        cv::rectangle(frame, tbox, onRoad ? cv::Scalar(0,0,255) : cv::Scalar(0,255,0), 2);cv::rectangle(frame, d.box, cv::Scalar(0,0,255), 2); // red raw dets
     putText(frame, cv::format("DET %.2f", d.score), d.box.tl() + cv::Point(0,-3),
             cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0,0,255), 1);
 }
@@ -676,84 +695,63 @@ for (int id : keep) {
         persons++;
 
         // Attach this track to a Det this frame (reuse pose + lidar distance)
-	int di = match_det_by_iou(tbox, dets, 0.3f);
+        int di = match_det_by_iou(tbox, dets, 0.3f);
+        if (di < 0) continue;
 
-	// If no match, still draw the TRACK (so you can see ByteTrack output)
-	Det* dp = nullptr;
-	if (di >= 0) {
-	    dp = &dets[di];
-	    if (dp->cls != 0) dp = nullptr; // safety
-	}
+        Det& d = dets[di];
+        if (d.cls != 0) continue; // onlt apply to people 
+
         // bbox centre into angle 
-const cv::Rect& angle_box = (dp ? dp->box : tbox);
-float cam_angle = bbox_center_angle(angle_box, frame.cols, cam_fov_deg);
+        float cam_angle = bbox_center_angle(d.box, frame.cols, cam_fov_deg);
 
-        // Check if pedestrian center is in road trapezoid (replaces segNet road mask)
-        int cx = tbox.x + tbox.width / 2;
-        int cy = tbox.y + tbox.height / 2;
-        bool onRoad = pointInRoadTrapezoid(cx, cy, frame.cols, frame.rows);
-
-        // draw bbox: red if on road, green otherwise
-        cv::rectangle(frame, tbox, onRoad ? cv::Scalar(0,0,255) : cv::Scalar(0,255,0), 2);
+        cv::rectangle(frame, tbox, cv::Scalar(0,255,0), 2); // draw bounding box in green 
 
         // draw track id
         putText(frame, cv::format("ID:%zu", tp->getTrackId()), tbox.tl() + cv::Point(0,-20),
                 cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0,255,255), 2);
 
+        // drawing on keypoints here 
+        // connects the lines using the coco17_pairs from above 
+        if (C >= 56 && !d.kpts.empty()) {
+            const float kpt_th = 0.30f;
 
-	std::string label;
+            // draw keypoints
+            for (int k = 0; k < (int)d.kpts.size(); k++) {
+                if (d.ksc[k] >= kpt_th) {
+                    cv::circle(frame, d.kpts[k], 3, cv::Scalar(0, 0, 255), -1);
+                }
+            }
 
-	// Only if we matched a detection this frame: pose + facing + distance + score
-	if (dp) {
-	    const Det& d = *dp;
+            // draw skeleton lines
+            for (int pi = 0; pi < COCO17_NUM_PAIRS; pi++) {
+                int a = COCO17_PAIRS[pi][0];
+                int b = COCO17_PAIRS[pi][1];
+                if (a < 0 ||  b < 0 ||  a >= (int)d.kpts.size() || b >= (int)d.kpts.size()) continue;
 
-	    // drawing on keypoints here
-	    if (C >= 56 && !d.kpts.empty()) {
-	        const float kpt_th = 0.30f;
-	
-	        // draw keypoints
-	        for (int k = 0; k < (int)d.kpts.size(); k++) {
-	            if (d.ksc[k] >= kpt_th) {
-	                cv::circle(frame, d.kpts[k], 3, cv::Scalar(0, 0, 255), -1);
-	            }
-	        }
+                if (d.ksc[a] >= kpt_th && d.ksc[b] >= kpt_th) {
+                    cv::line(frame, d.kpts[a], d.kpts[b], cv::Scalar(255, 0, 0), 2);
+                }
+            }
+        }
+        if (!d.kpts.empty()) {   // here we can now draw on the symbol to indicate if they are facing away or not 
+            draw_torso_normal_symbol(frame, d);
+        }
 
-	        // draw skeleton lines
-	        for (int pi = 0; pi < COCO17_NUM_PAIRS; pi++) {
-	            int a = COCO17_PAIRS[pi][0];
-	            int b = COCO17_PAIRS[pi][1];
-	            if (a < 0 || b < 0 || a >= (int)d.kpts.size() || b >= (int)d.kpts.size()) continue;
+        if ((++pf % 30) == 0) {
+            std::cout << "[FUSE] det_angle_deg=" << (cam_angle * 180.0f / 3.14159265f)
+                      << " dist=" << d.distance_m << "m\n";
+        }
 
-	            if (d.ksc[a] >= kpt_th && d.ksc[b] >= kpt_th) {
-	                cv::line(frame, d.kpts[a], d.kpts[b], cv::Scalar(255, 0, 0), 2);
-	            }
-	        }
-	    }
-	
-	    if (!d.kpts.empty()) {
-	        draw_torso_normal_symbol(frame, d);
-	    }
+        // adding the distance measured onto the frame for visual display 
+        std::string label;
+        if (d.distance_m > 0.0f) // if there s distnace present display it 
+            label = cv::format("ID:%zu %.2f %.1fm", tp->getTrackId(), d.score, d.distance_m);
+        else
+            label = cv::format("ID:%zu %.2f", tp->getTrackId(), d.score);
 
-	    if ((++pf % 30) == 0) {
-	        std::cout << "[FUSE] det_angle_deg=" << (cam_angle * 180.0f / 3.14159265f)
-	                  << " dist=" << d.distance_m << "m\n";
-	    }
-
-	    if (d.distance_m > 0.0f)
-	        label = cv::format("ID:%zu %.2f %.1fm", tp->getTrackId(), d.score, d.distance_m);
-	    else
-	        label = cv::format("ID:%zu %.2f", tp->getTrackId(), d.score);
-
-	} else {
-	    // Unmatched track: still show it, but no pose/score/dist available
-	    label = cv::format("ID:%zu (unmatched)", tp->getTrackId());
-	}
-
-	// put label on frame
-	putText(frame, label, tbox.tl() + cv::Point(0,-3),
-	        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0,255,0), 1);
-
-
+        //put all on frame 
+        putText(frame, label, tbox.tl() + cv::Point(0,-3),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0,255,0), 1);
     }
 
 
@@ -768,23 +766,41 @@ float cam_angle = bbox_center_angle(angle_box, frame.cols, cam_fov_deg);
         }
 
 
-	if (!trapezoidInitialized && frame.cols > 0 && frame.rows > 0) {
-	    // Define trapezoid: bottom-wide (near car), top-narrow (horizon)
-	    // Normalized: x 0-1 left-right, y 0-1 top-bottom
-	    float w = (float)frame.cols, h = (float)frame.rows;
-	roadTrapezoid = {
-	    cv::Point2f(0.25f * w, 0.95f * h),  // bottom-left – narrower
-	    cv::Point2f(0.75f * w, 0.95f * h),  // bottom-right
-	    cv::Point2f(0.55f * w, 0.45f * h),  // top-right – shifted toward road
-	    cv::Point2f(0.45f * w, 0.45f * h)   // top-left
-	};
-	    trapezoidInitialized = true;
-	}
-	if (trapezoidInitialized && show) {
-	//    std::vector<cv::Point> pts;
-	//    for (const auto& p : roadTrapezoid) pts.push_back(cv::Point((int)p.x, (int)p.y));
-	//    cv::polylines(frame, std::vector<std::vector<cv::Point>>{pts}, true, cv::Scalar(0, 255, 0), 2);
-	}
+	// -------------------------
+// SEGMENTATION OVERLAY HERE
+// -------------------------
+if ((frames % SEG_INTERVAL == 0) || !roadMaskValid) {
+    // A) pack BGR -> RGB
+    for (int y=0; y<frame.rows; y++) {
+        const cv::Vec3b* src = frame.ptr<cv::Vec3b>(y);
+        uchar3* dst = cudaInput + y * frame.cols;
+        for (int x=0; x<frame.cols; x++) {
+            dst[x] = make_uchar3(src[x][2], src[x][1], src[x][0]);
+        }
+    }
+    seg->Process(cudaInput, frame.cols, frame.rows);
+
+    // B) get class ID mask (uint8 per pixel)
+    segClassMask.resize(frame.cols * frame.rows);
+    seg->Mask(segClassMask.data(), frame.cols, frame.rows);
+    // C) binary road mask: 255 = road, 0 = not road
+    roadMask = cv::Mat(frame.rows, frame.cols, CV_8UC1);
+    for (int i = 0; i < frame.rows * frame.cols; i++) {
+        roadMask.data[i] = (segClassMask[i] == (uint8_t)roadClassId) ? 255 : 0;
+    }
+    roadMaskValid = true;
+}
+if (roadMaskValid && show) {
+    cv::Mat greenOverlay(frame.rows, frame.cols, CV_8UC3, cv::Scalar(0,0,0));
+    for (int y = 0; y < frame.rows; y++) {
+        for (int x = 0; x < frame.cols; x++) {
+            if (roadMask.at<uint8_t>(y, x) == 255) {
+                greenOverlay.at<cv::Vec3b>(y, x) = cv::Vec3b(0, 255, 0); // BGR green
+            }
+        }
+    }
+    cv::addWeighted(frame, 1.0, greenOverlay, 0.3, 0, frame);
+}
 	// display annotated frame in a window 
         if(show){
 	    cv::Mat disp;

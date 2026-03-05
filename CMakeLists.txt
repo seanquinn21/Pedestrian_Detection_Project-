@@ -36,12 +36,22 @@ add_executable(avdet
   src/main.cpp
   src/trt_yolo.cpp
   src/lidar_c1.cpp
+  src/lane_detector.cpp
+  src/lane_metrics.cpp
   ${RPLIDAR_SDK_SRC} #compile sdk sources to this target 
 )
-# sdk public and internal headers 
+
+# [REMOVED] segNet networks symlink - no longer using jetson-inference
+# set(NETWORKS_SOURCE ...) add_custom_command(...)
+
+# [REMOVED] jetson-inference/jetson-utils - no longer using segNet
+# set(JETSON_INF_DIR ...) target_include_directories(...) target_link_directories(...)
+
+# sdk public and internal headers, lane detection (mv_lane)
 target_include_directories(avdet PRIVATE
   ${RPLIDAR_SDK_DIR}/include
   ${RPLIDAR_SDK_DIR}/src
+  ${CMAKE_SOURCE_DIR}/src/include
 )
 target_include_directories(avdet PRIVATE /usr/include/eigen3)
 
@@ -51,4 +61,5 @@ target_link_libraries(avdet PRIVATE
   nvinfer nvonnxparser cudart 
   pthread rt
   bytetrack
+  # jetson-inference jetson-utils  [REMOVED - no longer using segNet]
 )
