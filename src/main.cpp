@@ -12,13 +12,14 @@
 #include <algorithm>
 #include <vector>
 #include <memory>
+#include <deque>
+#include <unordered_map>
 #include "ByteTrack/BYTETracker.h"
 #include "ByteTrack/Object.h"
 #include "ByteTrack/Rect.h"
 #include "ByteTrack/STrack.h"
 #include "lane/lane_detector.hpp"
-// REMOVED segNet - replaced with trapezoid road regio
-// since replaced with canny detector 
+// [REMOVED] segNet - replaced with trapezoid road region
 // #include <jetson-inference/segNet.h>
 // #include <jetson-utils/cudaMappedMemory.h>
 // #include <jetson-utils/cudaResize.h>
@@ -289,6 +290,7 @@ static int match_det_by_iou(const cv::Rect& tbox, const std::vector<Det>& dets,
     return best;
 }
 
+// Lane detection: mv_lane (lane_detector.hpp / lane_detector.cpp)
 
 // Entry point
 //  open camera , initialise TRT engine,
@@ -339,14 +341,16 @@ std::cout << "[DEBUG] main() start" << std::endl;
 	bool show = true;
 	bool lidar_debug = false;
 	bool bypass_letterbox = false;
-	bool disable_lidar = false; 
-        for (int i = 1; i < argc; ++i) {
-        if (string(argv[i]) == "--no-display") show = false;
-	if (string(argv[i]) == "--lidar-debug") lidar_debug = true;
-	if (string(argv[i]) == "--bypass-letterbox") bypass_letterbox = true;
-	if (string(argv[i]) == "--no-lidar") disable_lidar = true;
-
-    }
+	bool disable_lidar = false;
+	bool disable_lane = false;
+	for (int i = 1; i < argc; ++i) {
+	    std::string arg = argv[i];
+	    if (arg == "--no-display") show = false;
+	    else if (arg == "--lidar-debug") lidar_debug = true;
+	    else if (arg == "--bypass-letterbox") bypass_letterbox = true;
+	    else if (arg == "--no-lidar") disable_lidar = true;
+	    else if (arg == "--no-lane-detect") disable_lane = true;
+	}
 
 
  std::cout << "[DEBUG] camera opened OK" << std::endl;
@@ -360,8 +364,9 @@ std::cout << "[DEBUG] main() start" << std::endl;
   std::cout << "[DEBUG] before trtInit" << std::endl;
     trtInit("/home/sean/models/yolov8n/yolov8s_pose_416_fp16.plan"); // init using the .plan file path
 
-
-
+// [REMOVED] segNet - replaced with trapezoid road region (lighter, no GPU seg model)
+// segNet* seg = nullptr;
+// seg = segNet::Create(...);  // was here
 
     // ByteTrack tracker from pulled repo 
 byte_track::BYTETracker tracker(
@@ -385,11 +390,14 @@ if (use_lidar && !disable_lidar) {
     std::cout << "[DEBUG] lidar disabled" << std::endl;
 }
 
-// Lane detector 
-lane::LaneConfig lane_cfg;
-lane_cfg.update_every_n = 3;  // how many frames between each time  we run the detector 
-lane_cfg.ema_alpha = 0.20f;  // for ema smoothing 
-lane::LaneDetector lane_detector(lane_cfg);
+// Lane detector (mv_lane), optional via --no-lane-detect
+std::unique_ptr<lane::LaneDetector> lane_detector;
+if (!disable_lane) {
+    lane::LaneConfig lane_cfg;
+    lane_cfg.update_every_n = 3;
+    lane_cfg.ema_alpha = 0.20f;
+    lane_detector = std::make_unique<lane::LaneDetector>(lane_cfg);
+}
 
 // main procesing loop - grab frame , run inference , postprocess, draw and log fps
     Mat frame; //opencv container called frame, each loop cap.read(frame) will fill this 
@@ -403,10 +411,12 @@ lane::LaneDetector lane_detector(lane_cfg);
         if(!cap.read(frame) || frame.empty()) break; // if frames empty or not read right break from loop 
 
         frame_idx++;
-        lane::LaneEstimate lane_est = lane_detector.update(frame, frame_idx, {}, nullptr);
-        lane_detector.drawOverlay(frame, lane_est, /*fill_lane=*/true, /*draw_roi=*/false);
+        if (lane_detector) {
+            lane::LaneEstimate lane_est = lane_detector->update(frame, frame_idx, {}, nullptr);
+            lane_detector->drawOverlay(frame, lane_est, /*fill_lane=*/true, /*draw_roi=*/false);
+        }
 
-
+	// [REMOVED] CUDA buffers for segNet (cudaInput, cudaOutput, cudaAllocMapped)
 
 	// letterbox as defined above to 416x416
         float ratio = 1.0f; 
@@ -666,6 +676,10 @@ for (int id : keep) {
     int persons = 0; // count of persons in frame 
     static int pf = 0;
 
+    // Per-track trail: last N bbox centres, drawn as a line
+    static std::unordered_map<size_t, std::deque<cv::Point2f>> track_trail;
+    const int TRACK_TRAIL_N = 30;
+
     for (const auto& tp : tracks) { // loop over tracked persons
         if (!tp || !tp->isActivated()) continue;
         if (tp->getSTrackState() != byte_track::STrackState::Tracked) continue;
@@ -674,6 +688,21 @@ for (int id : keep) {
         if (tbox.area() <= 0) continue;
 
         persons++;
+
+        // Append current bbox centre to this track's trail
+        cv::Point2f center(static_cast<float>(tbox.x + tbox.width / 2),
+                           static_cast<float>(tbox.y + tbox.height / 2));
+        size_t tid = tp->getTrackId();
+        auto& trail = track_trail[tid];
+        trail.push_back(center);
+        while (static_cast<int>(trail.size()) > TRACK_TRAIL_N)
+            trail.pop_front();
+
+        // Draw trail as a line (oldest to newest)
+        if (trail.size() >= 2) {
+            for (size_t i = 1; i < trail.size(); ++i)
+                cv::line(frame, trail[i - 1], trail[i], cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
+        }
 
         // Attach this track to a Det this frame (reuse pose + lidar distance)
 	int di = match_det_by_iou(tbox, dets, 0.3f);
@@ -768,6 +797,10 @@ float cam_angle = bbox_center_angle(angle_box, frame.cols, cam_fov_deg);
         }
 
 
+	// -------------------------
+	// [REMOVED] segNet - was: Process, Mask, road mask build every SEG_INTERVAL frames
+	// Replaced with trapezoid road region (below)
+	// -------------------------
 	if (!trapezoidInitialized && frame.cols > 0 && frame.rows > 0) {
 	    // Define trapezoid: bottom-wide (near car), top-narrow (horizon)
 	    // Normalized: x 0-1 left-right, y 0-1 top-bottom
